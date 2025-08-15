@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>A 股股息率（腾讯财经 JSONP）</title>
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+<style>
+  body{font-family:Arial,sans-serif;background:#f5f5f5;padding:2rem;}
+  h1{text-align:center;margin-bottom:1rem;}
+  table{border-collapse:collapse;width:100%;max-width:800px;margin:auto;background:#fff;}
+  th,td{border:1px solid #ddd;padding:.6rem .9rem;text-align:left;}
+  th{background:#1976d2;color:#fff;}
+  .center{text-align:center;}
+  .loading{padding:2rem;font-size:1.2rem;color:#555;}
+</style>
+</head>
+<body>
+
+<div x-data="app()" x-init="init()">
+  <h1>A 股股息率（腾讯财经 JSONP）</h1>
+
+  <template x-if="loading"><div class="loading center">加载中…</div></template>
+
+  <template x-if="!loading && rows.length">
+    <table>
+      <thead>
+        <tr>
+          <th>代码</th><th>名称</th><th>每股分红 (元)</th>
+          <th>最新价 (元)</th><th>股息率</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.symbol">
+          <tr>
+            <td x-text="r.symbol"></td>
+            <td x-text="r.name || '—'"></td>
+            <td x-text="r.dividend.toFixed(3)"></td>
+            <td x-text="r.price!==null ? r.price.toFixed(3) : '—'"></td>
+            <td x-text="r.yield!==null ? (r.yield*100).toFixed(2)+'%' : '—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </template>
+
+  <template x-if="!loading && rows.length===0"><p class="loading center">未读取到任何数据。</p></template>
+</div>
+
+<script>
+function app() {
+  return {
+    rows: [],               // [{symbol, dividend, price, name, yield}]
+    loading: true,
+    symbolMap: null,        // Map<code, row>，方便后面快速匹配
+
+    /* -------------------------------------------------
+       初始化流程
+       1️⃣ 读取本地 CSV
+       2️⃣ 把代码转成腾讯接口需要的 “shxxxx / szxxxx”
+       3️⃣ 为每支股票创建一个 <script> (JSONP) 并等它们全部加载完
+       4️⃣ 计算股息率、渲染表格
+       ------------------------------------------------- */
+    async init() {
+      try {
+        // ① 读取 CSV
+        const csv = await this.fetchText('dividends.csv');
+        const raw = this.parseCSV(csv);
+
+        // ② 统一代码并准备 rows
+        this.rows = raw.map(it => {
+          let code = it.symbol.trim();                // 600519 / 000001 …
+          // 根据首位判断是沪（sh）还是深（sz）
+          const prefix = code.startsWith('6') ? 'sh' : 'sz';
+          const fullCode = `${prefix}${code}`;        // sh600519 / sz000001
+          return {
+            symbol: fullCode,                         // 用于请求的代码
+            rawCode: code,                            // 原始 6 位代码，后面展示用
+            dividend: parseFloat(it.dividend) || 0,
+            price: null,
+            name: null,
+            yield: null,
+          };
+        });
+        // 为后面快速查找准备 Map
+        this.symbolMap = new Map(this.rows.map(r => [r.symbol, r]));
+
+        // ③ 加载所有行情（JSONP）
+        await this.loadAllQuotes();
+
+        // ④ 计算股息率（已在 loadAllQuotes 里完成，此处仅作标记）
+      } catch (e) {
+        console.error('初始化出错 →', e);
+        alert('读取 CSV 或加载行情失败，请打开控制台查看详情。');
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    /* ------------------- 基础工具 ------------------- */
+    async fetchText(url) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`fetch ${url} ${r.status}`);
+      return await r.text();
+    },
+
+    // 只解析两列：symbol, dividend
+    parseCSV(txt) {
+      const lines = txt.trim().split('\n');
+      const head = lines[0].split(',').map(v => v.trim().toLowerCase());
+      const iSym = head.indexOf('symbol');
+      const iDiv = head.indexOf('dividend');
+      if (iSym === -1 || iDiv === -1) throw new Error('CSV 必须包含 symbol 与 dividend 两列');
+      return lines.slice(1).map(l => {
+        const cols = l.split(',').map(v => v.trim());
+        return { symbol: cols[iSym], dividend: cols[iDiv] };
+      });
+    },
+
+    /* ------------------- ③ JSONP 抓行情 ------------------- */
+    // 为所有股票创建 <script>，并在全部加载完后 resolve
+    loadAllQuotes() {
+      const promises = this.rows.map(row => this.loadQuote(row.symbol));
+      return Promise.all(promises);
+    },
+
+    // 单只股票的 JSONP 加载。腾讯返回形如：
+    //   v_sh600519="1~贵州茅台~600519~1733.77~..."
+    // 加载完后立即解析并写回 rows
+    loadQuote(fullCode) {
+      return new Promise((resolve, reject) => {
+        const url = `https://qt.gtimg.cn/q=${fullCode}&_=${Date.now()}`; // 防止缓存
+
+        const script = document.createElement('script');
+        script.src = url;
+        script.async = true;
+
+        // 处理加载成功
+        script.onload = () => {
+          try {
+            // 变量名形如 v_sh600519 / v_sz000001
+            const varName = `v_${fullCode}`;
+            const raw = window[varName];
+            if (!raw) throw new Error(`变量 ${varName} 未定义`);
+
+            // raw 形如 "1~贵州茅台~600519~1733.77~..."
+            const parts = raw.split('~');
+            const name = parts[1] || '';
+            const price = parseFloat(parts[3]);
+
+            const row = this.symbolMap.get(fullCode);
+            if (row) {
+              row.name = name;
+              row.price = isNaN(price) ? null : price;
+              row.yield = (row.price && row.dividend) ? row.dividend / row.price : null;
+            }
+            // 清理全局变量（可选，防止污染）
+            delete window[varName];
+            resolve();
+          } catch (e) {
+            reject(e);
+          } finally {
+            // 移除 script 节点
+            script.remove();
+          }
+        };
+
+        // 处理加载错误
+        script.onerror = () => {
+          reject(new Error(`JSONP 请求失败 ${url}`));
+          script.remove();
+        };
+
+        // 把 script 加入文档，发起请求
+        document.body.appendChild(script);
+      });
+    },
+  };
+}
+</script>
+
+</body>
+</html>
